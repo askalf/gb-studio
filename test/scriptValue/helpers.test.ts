@@ -1,9 +1,12 @@
 import {
   PrecompiledValueFetch,
+  PrecompiledValueRPNOperation,
   ScriptValue,
   ScriptValueAtom,
   isScriptValue,
 } from "../../src/shared/lib/scriptValue/types";
+import { scriptValueToSubpixels } from "../../src/lib/compiler/scriptBuilder/helpers";
+import { subpxShiftForUnits } from "../../src/shared/lib/helpers/subpixels";
 import {
   addScriptValueConst,
   addScriptValueToScriptValue,
@@ -20,6 +23,45 @@ import {
   variableInScriptValue,
   walkScriptValue,
 } from "../../src/shared/lib/scriptValue/helpers";
+
+// Evaluate precompiled RPN operations against a single fetched local value
+// so tests can assert on the value the generated code computes, not just on
+// the operations it emits.
+const evalPrecompiledRPN = (
+  ops: PrecompiledValueRPNOperation[],
+  localValue: number,
+): number => {
+  const stack: number[] = [];
+  const pop = () => {
+    const value = stack.pop();
+    if (value === undefined) {
+      throw new Error("RPN stack underflow");
+    }
+    return value;
+  };
+  for (const op of ops) {
+    if (op.type === "number") {
+      stack.push(op.value);
+    } else if (op.type === "local" || op.type === "variable") {
+      stack.push(localValue);
+    } else if (op.type === "shr") {
+      const b = pop();
+      stack.push(pop() >> b);
+    } else if (op.type === "shl") {
+      const b = pop();
+      stack.push(pop() << b);
+    } else if (op.type === "add") {
+      const b = pop();
+      stack.push(pop() + b);
+    } else if (op.type === "bAND") {
+      const b = pop();
+      stack.push(pop() & b);
+    } else {
+      throw new Error(`Unsupported operation "${op.type}"`);
+    }
+  }
+  return pop();
+};
 
 test("should perform constant folding for addition", () => {
   const input: ScriptValue = {
@@ -993,6 +1035,211 @@ test("should precompile to list of required operations", () => {
       },
     ],
   ]);
+});
+
+test("should mask rather than drop shift right followed by shift left", () => {
+  const input: ScriptValue = {
+    type: "shl",
+    valueA: {
+      type: "shr",
+      valueA: {
+        type: "property",
+        target: "player",
+        property: "xpos",
+      },
+      valueB: {
+        type: "number",
+        value: 3,
+      },
+    },
+    valueB: {
+      type: "number",
+      value: 3,
+    },
+  };
+  expect(precompileScriptValue(input)[0]).toEqual([
+    {
+      type: "local",
+      value: "local_0",
+      offset: 1,
+    },
+    {
+      type: "number",
+      value: 8,
+    },
+    {
+      type: "shr",
+    },
+    {
+      type: "number",
+      value: 0xfff8,
+    },
+    {
+      type: "bAND",
+    },
+  ]);
+});
+
+test("should mask off the sub tile remainder when reading a position in tiles and writing it back in tiles", () => {
+  // Reading an actor position in tile units emits "shr 8", converting a
+  // value back to subpixels emits "shl 8". Combining the two must still
+  // round the position down to the start of the tile.
+  const shift = subpxShiftForUnits("tiles");
+  const input = scriptValueToSubpixels(
+    {
+      type: "property",
+      target: "player",
+      property: "xpos",
+    },
+    "tiles",
+  );
+  const [rpn] = precompileScriptValue(input);
+  expect(rpn).toEqual([
+    {
+      type: "local",
+      value: "local_0",
+      offset: 1,
+    },
+    {
+      type: "number",
+      value: 0xff00,
+    },
+    {
+      type: "bAND",
+    },
+  ]);
+  // An actor standing part way through tile 2 snaps back to tile 2
+  const position = (2 << shift) + 4;
+  expect(evalPrecompiledRPN(rpn, position)).toEqual(
+    (position >> shift) << shift,
+  );
+});
+
+test("(control) should keep shift right followed by a shift left of a different size", () => {
+  const input: ScriptValue = {
+    type: "shl",
+    valueA: {
+      type: "shr",
+      valueA: {
+        type: "variable",
+        value: "L0",
+      },
+      valueB: {
+        type: "number",
+        value: 4,
+      },
+    },
+    valueB: {
+      type: "number",
+      value: 2,
+    },
+  };
+  expect(precompileScriptValue(input)[0]).toEqual([
+    {
+      type: "variable",
+      value: "L0",
+    },
+    {
+      type: "number",
+      value: 4,
+    },
+    {
+      type: "shr",
+    },
+    {
+      type: "number",
+      value: 2,
+    },
+    {
+      type: "shl",
+    },
+  ]);
+});
+
+test("(control) should mask a shift pair with an addition between them", () => {
+  // The existing "shr N, add K, shl N" optimisation already masks, this
+  // pins that the two optimisations agree on the mask they produce.
+  const input: ScriptValue = {
+    type: "shl",
+    valueA: {
+      type: "add",
+      valueA: {
+        type: "shr",
+        valueA: {
+          type: "variable",
+          value: "L0",
+        },
+        valueB: {
+          type: "number",
+          value: 3,
+        },
+      },
+      valueB: {
+        type: "number",
+        value: 1,
+      },
+    },
+    valueB: {
+      type: "number",
+      value: 3,
+    },
+  };
+  expect(precompileScriptValue(input)[0]).toEqual([
+    {
+      type: "variable",
+      value: "L0",
+    },
+    {
+      type: "number",
+      value: 8,
+    },
+    {
+      type: "add",
+    },
+    {
+      type: "number",
+      value: 0xfff8,
+    },
+    {
+      type: "bAND",
+    },
+  ]);
+});
+
+test("should mask with a shift of zero without changing the value", () => {
+  const input: ScriptValue = {
+    type: "shl",
+    valueA: {
+      type: "shr",
+      valueA: {
+        type: "variable",
+        value: "L0",
+      },
+      valueB: {
+        type: "number",
+        value: 0,
+      },
+    },
+    valueB: {
+      type: "number",
+      value: 0,
+    },
+  };
+  const [rpn] = precompileScriptValue(input);
+  expect(rpn).toEqual([
+    {
+      type: "variable",
+      value: "L0",
+    },
+    {
+      type: "number",
+      value: 0xffff,
+    },
+    {
+      type: "bAND",
+    },
+  ]);
+  expect(evalPrecompiledRPN(rpn, 12345)).toEqual(12345);
 });
 
 test("should convert expression ($00$ + 8) to script value", () => {
